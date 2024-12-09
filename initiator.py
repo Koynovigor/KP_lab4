@@ -4,8 +4,6 @@ import socket
 from os import urandom
 
 from Crypto.Cipher import DES
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.dh import DHParameterNumbers
 
 # Параметры группы DH из RFC 2412
 p_hex = int(
@@ -17,11 +15,10 @@ p_hex = int(
     "FFFFFFFFFFFFFFFF", 16
 )
 g = 2
-parameters = DHParameterNumbers(p_hex, g).parameters()
 
-# Генерация ключей
-private_key = parameters.generate_private_key()
-public_key = private_key.public_key()
+# Секретный параметр инициатора (x) и вычисление g^x
+x = int.from_bytes(urandom(32), "big")  # Случайное число для x
+g_x = pow(g, x, p_hex)  # Вычисляем g^x mod p
 
 
 # Вспомогательные функции
@@ -63,11 +60,8 @@ def client_program():
 
     # Шаг 3: Отправляем CKY-I, CKY-R, OK_KEYX, GRP, g^x, EHAO
     CKY_I = urandom(8)
-    public_key_bytes = public_key.public_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PublicFormat.SubjectPublicKeyInfo
-    )
-    client_socket.send(CKY_I + CKY_R + OK_KEYX + public_key_bytes + EHAO)
+    g_x_bytes = g_x.to_bytes((g_x.bit_length() + 7) // 8, "big")  # Преобразуем g^x в байты
+    client_socket.send(CKY_I + CKY_R + OK_KEYX + g_x_bytes + EHAO)
 
     # Шаг 4: Получаем CKY-R, CKY-I, OK_KEYX, GRP, g^y, EHAS
     data = client_socket.recv(2048)
@@ -77,17 +71,20 @@ def client_program():
         print("Authentication failed: CKY mismatch")
         client_socket.close()
         return
-    server_public_key = serialization.load_pem_public_key(data[16:-len(EHAO)])
+    g_y = int.from_bytes(data[16:-len(EHAO)], "big")  # Преобразуем g^y из байтов
     EHAS = data[-len(EHAO):]
 
-    # Вычисляем общий секретный ключ
-    shared_key = private_key.exchange(server_public_key)
+    # Вычисляем общий секретный ключ: g^(xy) mod p
+    shared_key = pow(g_y, x, p_hex)
+
+    # Преобразуем общий секретный ключ в байты
+    key_size = (p_hex.bit_length() + 7) // 8  # Длина ключа в байтах
+    des_key = shared_key.to_bytes(key_size, "big")[:8]
 
     # Шаг 5: Отправляем CKY-I, CKY-R, OK_KEYX, GRP, g^x, IDP*, ID(I), ID(R), E{Ni}Kr
-    des_key = shared_key[:8]
     des = DES.new(des_key, DES.MODE_ECB)
     encrypted_Ni = des.encrypt(pad(Ni))
-    client_socket.send(CKY_I + CKY_R + OK_KEYX + public_key_bytes + b"IDP" + ID_I + ID_R + encrypted_Ni)
+    client_socket.send(CKY_I + CKY_R + OK_KEYX + g_x_bytes + b"IDP" + ID_I + ID_R + encrypted_Ni)
 
     # Шаг 6: Получаем CKY-R, CKY-I, OK_KEYX, GRP, 0, 0, IDP, E{Nr, Ni}Ki, ID(R), ID(I), prf(...)
     data = client_socket.recv(2048)
@@ -109,14 +106,14 @@ def client_program():
     # Проверяем PRF от сервера
     Kir = prf(b'\x00', Ni + Nr)
     server_prf = data[-32:]
-    expected_prf = prf(Kir, ID_R + ID_I + public_key_bytes + EHAS)
+    expected_prf = prf(Kir, ID_R + ID_I + g_x_bytes + EHAS)
     if server_prf != expected_prf:
         print("Authentication failed: Server PRF mismatch")
         client_socket.close()
         return
 
     # Шаг 7: Отправляем CKY-I, CKY-R, OK_KEYX, GRP, 0, 0, IDP, prf(...)
-    client_prf = prf(Kir, ID_I + ID_R + public_key_bytes + EHAS)
+    client_prf = prf(Kir, ID_I + ID_R + g_x_bytes + EHAS)
     client_socket.send(CKY_I + CKY_R + OK_KEYX + b"0" + b"0" + b"IDP" + client_prf)
 
     print("Authentication successful!")
