@@ -71,7 +71,8 @@ def client_program():
         print("Authentication failed: CKY mismatch")
         client_socket.close()
         return
-    g_y = int.from_bytes(data[16:-len(EHAO)], "big")  # Преобразуем g^y из байтов
+    g_y_bytes = data[23:-len(EHAO)]
+    g_y = int.from_bytes(g_y_bytes, "big")  # Преобразуем g^y из байтов
     EHAS = data[-len(EHAO):]
 
     # Вычисляем общий секретный ключ: g^(xy) mod p
@@ -94,7 +95,7 @@ def client_program():
         print("Authentication failed: CKY mismatch")
         client_socket.close()
         return
-    encrypted_Nr_Ni = data[-64:-32]
+    encrypted_Nr_Ni = data[-88:-56]
     Nr_Ni = des.decrypt(encrypted_Nr_Ni)
     Nr = Nr_Ni[:16]
     Ni_received = Nr_Ni[16:]
@@ -106,7 +107,7 @@ def client_program():
     # Проверяем PRF от сервера
     Kir = prf(b'\x00', Ni + Nr)
     server_prf = data[-32:]
-    expected_prf = prf(Kir, ID_R + ID_I + g_x_bytes + EHAS)
+    expected_prf = prf(Kir, ID_R + ID_I + g_y_bytes + EHAS)
     if server_prf != expected_prf:
         print("Authentication failed: Server PRF mismatch")
         client_socket.close()

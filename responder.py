@@ -70,7 +70,8 @@ def server_program():
         print("Authentication failed: CKY-R mismatch")
         conn.close()
         return
-    g_x = int.from_bytes(data[16:-len(EHAS)], "big")  # Преобразуем g^x из байтов
+    g_x_bytes = data[23:-len(EHAS)]
+    g_x = int.from_bytes(g_x_bytes, "big")  # Преобразуем g^x из байтов
     EHAO = data[-len(EHAS):]
 
     # Вычисляем общий секретный ключ: g^(xy) mod p
@@ -99,7 +100,7 @@ def server_program():
     # Шаг 7: Получаем финальное подтверждение
     data = conn.recv(2048)
     client_prf = data[-32:]
-    expected_prf = prf(Kir, b"Initiator-ID" + ID_R + g_y_bytes + EHAS)
+    expected_prf = prf(Kir, b"Initiator-ID" + ID_R + g_x_bytes + EHAS)
     if client_prf != expected_prf:
         print("Authentication failed: Client PRF mismatch")
         conn.close()
