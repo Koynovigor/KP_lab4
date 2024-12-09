@@ -1,32 +1,60 @@
-from cryptography.hazmat.primitives import hashes, hmac
-from cryptography.hazmat.backends import default_backend
-from os import urandom
+import hashlib
+import hmac
 import socket
+from os import urandom
+
 from Crypto.Cipher import DES
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.dh import DHParameterNumbers
 
-# Параметры группы и алгоритмы
-GRP = {
-    "name": "Group-1", 
-    "generator": b'1234567812345678', 
-    "g_y": urandom(32)
-}
-EHAS = {"encryption": "AES", "hashing": "SHA-256", "authentication": "RSA"}  # Выбранные сервером алгоритмы
-Nr = urandom(16)  # Одноразовый номер ответчика
-ID_R = b"Responder-ID"  # Идентификатор ответчика
-OK_KEYX = b"OK_KEYX"  # Константа протокола для подтверждения обмена ключами
+from initiator import ID_I
 
-# Функция псевдослучайного генератора prf
-def prf(key, data):
-    h = hmac.HMAC(key, hashes.SHA256(), backend=default_backend())
-    h.update(data)
-    return h.finalize()
+# Параметры из RFC 2412
+p_hex = int(
+    "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1"
+    "29024E088A67CC74020BBEA63B139B22514A08798E3404DD"
+    "EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245"
+    "E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED"
+    "EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE65381"
+    "FFFFFFFFFFFFFFFF", 16
+)
+g = 2
+parameters = DHParameterNumbers(p_hex, g).parameters(default_backend())
 
+# Генерация ключей
+private_key = parameters.generate_private_key()
+public_key = private_key.public_key()
+
+# Вычисляем секретный параметр y
+y = int.from_bytes(urandom(32), "big")  # Секретное случайное число
+g_y = pow(g, y, p_hex)  # Вычисляем g^y mod p
+
+# Публичный ключ для передачи
+public_key_bytes = g_y.to_bytes((g_y.bit_length() + 7) // 8, "big")
+
+
+# Вспомогательные функции
 def pad(text):
+    """Добавление выравнивания для блока данных."""
     while len(text) % 8 != 0:
-        text += b' '
+        text += b" "
     return text
 
-# Серверная часть
+
+def prf(key, data):
+    """Псевдослучайная функция (PRF) с использованием HMAC и SHA-256."""
+    h = hmac.new(key, data, hashlib.sha256)
+    return h.digest()
+
+
+# Идентификаторы и параметры
+Nr = urandom(16)  # Одноразовый номер респондента
+ID_R = b"Responder-ID"
+OK_KEYX = b"OK_KEYX"
+EHAS = b"AES|SHA-256|HMAC"
+
+
 def server_program():
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.bind(('localhost', 5000))
@@ -36,58 +64,80 @@ def server_program():
     conn, addr = server_socket.accept()
     print(f"Connection from {addr}")
 
-    # 1. Сервер получает первый запрос и отправляет cookie (CKY-R) и OK_KEYX
+    # 1. Получаем начальный запрос от инициатора (0, 0, OK_KEYX)
     data = conn.recv(1024)
     if data[2:] != OK_KEYX:
+        print("Authentication failed: Invalid OK_KEYX")
         conn.close()
-        print("Authentication failed on server: NO OK_KEYX")
-    CKY_R = urandom(8) # 64 бита
-    conn.send(b"0" + CKY_R + OK_KEYX)
+        return
 
-    # 2. Сервер получает от клиента CKY-I, CKY-R, OK_KEYX, GRP, g^x, EHAO
-    data = conn.recv(1024)
+    # Отправляем CKY-R и OK_KEYX
+    CKY_R = urandom(8)
+    conn.send(CKY_R + OK_KEYX)
+
+    # 2. Получаем CKY-I, CKY-R, OK_KEYX, GRP, g^x, EHAO
+    data = conn.recv(2048)
     CKY_I = data[:8]
     received_CKY_R = data[8:16]
-    g_x = data[39:71]
-
-    # Проверка на соответствие CKY_R и полученного значения
     if received_CKY_R != CKY_R:
+        print("Authentication failed: CKY-R mismatch")
         conn.close()
-        print("Authentication failed on server: received_CKY_R != CKY_R")
+        return
 
-    # 3. Сервер отвечает с CKY-R, CKY-I, OK_KEYX, GRP, g^y, EHAS
-    response_payload = CKY_R + CKY_I + OK_KEYX + GRP["generator"] + GRP["g_y"] + EHAS["encryption"].encode()
-    conn.send(response_payload)
+    client_public_key_length = int.from_bytes(data[16:20], 'big')
+    client_public_key_bytes = data[20:20 + client_public_key_length]
+    EHAO = data[20 + client_public_key_length:]
 
-    # 4. Сервер получает финальный запрос с идентификаторами и зашифрованным Ni
-    data = conn.recv(1024)
-    g_y_key = GRP["g_y"][0:8]
-    des = DES.new(g_y_key, DES.MODE_ECB)
-    Ni_enc = data[98:]
-    Ni = des.decrypt(Ni_enc)
-    ID_I = data[74:86]
+    # Выводим доступные алгоритмы для отладки
+    print("EHAO received from initiator:", EHAO.decode())
 
+    try:
+        client_public_key = serialization.load_pem_public_key(
+            client_public_key_bytes, backend=default_backend()
+        )
+    except ValueError:
+        print("Authentication failed: Invalid public key from initiator")
+        conn.close()
+        return
+
+    # Вычисляем общий секретный ключ
+    shared_key = private_key.exchange(client_public_key)
+
+    # Отправляем CKY-R, CKY-I, OK_KEYX, GRP, g^y, EHAS
+    message = len(public_key_bytes).to_bytes(4, 'big') + public_key_bytes + EHAS
+    conn.send(message)
+
+    # 3. Получаем CKY-I, CKY-R, OK_KEYX, GRP, g^x, IDP*, ID(I), ID(R), E{Ni}Kr
+    data = conn.recv(2048)
+    encrypted_Ni = data[-16:]
+    des_key = shared_key[:8]
+    des = DES.new(des_key, DES.MODE_ECB)
+    Ni = des.decrypt(encrypted_Ni)
+
+    # 4. Отправляем CKY-R, CKY-I, OK_KEYX, GRP, 0, 0, IDP, E{Nr, Ni}Ki, ID(R), ID(I), prf(...)
+    encrypted_Nr_Ni = des.encrypt(pad(Nr + Ni))
     Kir = prf(b'\x00', Ni + Nr)
+    server_prf = prf(Kir, ID_R + ID_I + public_key_bytes + EHAS)
+    response = (
+            CKY_R + CKY_I + OK_KEYX + b"0" + b"0" + b"IDP" + encrypted_Nr_Ni + ID_R + ID_I + server_prf
+    )
+    conn.send(response)
 
-    # Отправка сообщения клиенту
-    verification_payload = CKY_R + CKY_I + OK_KEYX + GRP["generator"] + b"0" + b"0" + b"IDP"
-    enc = des.encrypt(pad(Nr + Ni)) + ID_R + ID_I
-    prf_resp = prf(Kir, ID_R + ID_I + GRP["generator"] + GRP["g_y"] + g_x + EHAS["encryption"].encode())
-    conn.send(verification_payload + enc + prf_resp)
+    # 5. Получаем финальное сообщение: CKY-I, CKY-R, OK_KEYX, GRP, 0, 0, IDP, prf(...)
+    data = conn.recv(2048)
+    client_prf = data[-32:]
+    expected_prf = prf(Kir, ID_I + ID_R + public_key_bytes + EHAS)
 
-    data = conn.recv(1024)
-    prf1 = prf(Kir, ID_I + ID_R + GRP["generator"] + g_x + GRP["g_y"] + EHAS["encryption"].encode())
-    prf1_resp = data[44:]
-
-    if prf1 == prf1_resp:
-        conn.send(b'success')
-        print("Server completed authentication")
-        print("Session key: ", Kir)
-    else:
+    if client_prf != expected_prf:
+        print("Authentication failed: Client PRF mismatch")
         conn.close()
-        print("Authentication failed on server: prf1")
+        return
 
+    print("Authentication successful!")
+    print("Session key:", Kir)
 
     conn.close()
-if __name__ == '__main__':
+
+
+if __name__ == "__main__":
     server_program()
